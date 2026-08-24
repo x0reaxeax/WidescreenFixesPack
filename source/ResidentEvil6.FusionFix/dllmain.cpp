@@ -7,6 +7,12 @@
 #include <map>
 #include <xinput.h>
 
+#define _DISPLAYMODEFIX_VERBOSE 1
+
+#ifdef _DISPLAYMODEFIX_VERBOSE
+#include <iostream>
+#endif // _DISPLAYMODEFIX_VERBOSE
+
 constexpr auto defaultAspectRatio = 16.0f / 9.0f;
 bool bSplitScreenSwapTopBottom = false;
 int32_t ResX = 0;
@@ -51,6 +57,77 @@ namespace DisplayModeFix {
 
     std::vector<D3DDISPLAYMODE> g_vDisplayModes{};   // Filtered display modes
 
+    static LPWSTR g_LogFilePath = nullptr;
+
+    static void InitializeLogging(void) {
+        if (nullptr != g_LogFilePath) {
+            return;
+        }
+
+        static constexpr LPCWSTR cwsLogFileName = L"re6crashfix.log";
+        DWORD cchDirectory = GetCurrentDirectoryW(0, nullptr);
+
+        if (0 == cchDirectory) {
+            fwprintf(
+                stderr,
+                L"Failed to get current directory length\n"
+            );
+            return;
+        }
+
+        SIZE_T cchDirectoryLength = cchDirectory - 1;
+        SIZE_T cchLogFileName = wcslen(cwsLogFileName);
+        SIZE_T cchLogFilePath = cchDirectoryLength + 1 + cchLogFileName + 1;
+
+        g_LogFilePath = new WCHAR[cchLogFilePath];
+
+        if (0 == GetCurrentDirectoryW(cchDirectory, g_LogFilePath)) {
+            fwprintf(
+                stderr,
+                L"Failed to get current directory\n"
+            );
+            delete[] g_LogFilePath;
+            g_LogFilePath = nullptr;
+            return;
+        }
+
+        swprintf(
+            g_LogFilePath + cchDirectoryLength,
+            cchLogFilePath - cchDirectoryLength,
+            L"\\%s",
+            cwsLogFileName
+        );
+
+        wprintf(
+            L"DisplayModeFix: Logging to %s\n",
+            g_LogFilePath
+        );
+    }
+
+    static void LogLine(
+        const std::wstring& wcsLine
+    ) {
+#ifdef _DISPLAYMODEFIX_VERBOSE
+        if (nullptr == g_LogFilePath) {
+            return;
+        }
+
+        FILE* pLogFile = nullptr;
+        errno_t err = _wfopen_s(&pLogFile, g_LogFilePath, L"a");
+        if (EXIT_SUCCESS != err || nullptr == pLogFile) {
+            fwprintf(
+                stderr,
+                L"Failed to open log file %s for appending\n",
+                g_LogFilePath
+            );
+            return;
+        }
+
+        fwprintf(pLogFile, L"%s\n", wcsLine.c_str());
+        fclose(pLogFile);
+#endif // _DISPLAYMODEFIX_VERBOSE
+    }
+
     UINT STDMETHODCALLTYPE Hook_GetAdapterModeCount(
         IDirect3D9* This,
         UINT Adapter,
@@ -61,6 +138,17 @@ namespace DisplayModeFix {
         }
 
         UINT uModeCount = g_RealGetAdapterModeCount(This, Adapter, Format);
+
+        WCHAR wszBuf[256] = { 0 };
+        wsprintfW(
+            wszBuf,
+            L"GetAdapterModeCount(This=%p, Adapter=%u, Format=%u) -> %u",
+            This,
+            Adapter,
+            (UINT) Format,
+            uModeCount
+        );
+        LogLine(wszBuf);
 
         // game only queries for D3DFMT_X8R8G8B8 modes, see disasm below
         if (D3DFMT_X8R8G8B8 != Format) {
@@ -103,6 +191,7 @@ namespace DisplayModeFix {
         }
 
         uModeCount = static_cast<UINT>(g_vDisplayModes.size());
+        LogLine(L"Filtered display modes count -> " + std::to_wstring(uModeCount));
 
         return uModeCount;
     }
@@ -143,6 +232,7 @@ namespace DisplayModeFix {
 
         void*** pppVtable = reinterpret_cast<void***>(pD3D9);
         if (nullptr == pppVtable || nullptr == *pppVtable) {
+            LogLine(L"HookD3D9Object: failed to get vtable pointer");
             return false;
         }
 
@@ -155,6 +245,8 @@ namespace DisplayModeFix {
             PAGE_EXECUTE_READWRITE,
             &dwOldProtect
         )) {
+            DWORD dwLastError = GetLastError();
+            LogLine(L"VirtualProtect failed in HookD3D9Object - E" + std::to_wstring(dwLastError));
             return false;
         }
 
@@ -164,6 +256,7 @@ namespace DisplayModeFix {
             ppVtable[IDX_EnumAdapterModes] == reinterpret_cast<void*>(&Hook_EnumAdapterModes)
         ) {
             // already hooked, bozo
+            LogLine(L"HookD3D9Object: already hooked, skipping");
             return true;
         }
 
@@ -198,6 +291,7 @@ namespace DisplayModeFix {
         g_pDirect3D9Instance = g_inlineSafetyHook.stdcall<IDirect3D9*>(SDKVersion);
         
         if (!HookD3D9Object(g_pDirect3D9Instance)) {
+            LogLine(L"Failed to hook IDirect3D9 object");
             MessageBoxA(
                 nullptr,
                 "Failed to hook IDirect3D9 object.",
@@ -229,11 +323,24 @@ namespace DisplayModeFix {
         return true;
     }
     bool Install(void) {
-        // 67E14B20 = Direct3DCreate9
+        HMODULE hD3D9 = GetModuleHandleA("d3d9.dll");
+        if (nullptr == hD3D9) {
+            LogLine(L"Install: failed to get handle to d3d9.dll");
+            return false;
+        }
+
+        FARPROC pfnDirect3DCreate9 = GetProcAddress(hD3D9, "Direct3DCreate9");
+        if (nullptr == pfnDirect3DCreate9) {
+            LogLine(L"Install: failed to get address of Direct3DCreate9");
+            return false;
+        }
+        
         g_inlineSafetyHook = safetyhook::create_inline(
-            reinterpret_cast<void*>(0x67E14B20),
+            reinterpret_cast<void*>(pfnDirect3DCreate9),
             reinterpret_cast<void*>(&Hooked_Direct3DCreate9)
         );
+
+        LogLine(L"Install: DisplayModeFix initialized successfully");
 
         return g_inlineSafetyHook.enabled();
     }
@@ -980,6 +1087,7 @@ void Init()
 
     if (DisplayModeFix::resConfig.enabled)
     {
+        DisplayModeFix::InitializeLogging();
         DisplayModeFix::resConfig.width = iniReader.ReadInteger("MAIN", "DisplayModeFixResX", 0);
         DisplayModeFix::resConfig.height = iniReader.ReadInteger("MAIN", "DisplayModeFixResY", 0);
 
